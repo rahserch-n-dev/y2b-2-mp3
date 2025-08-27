@@ -14,3 +14,10 @@ Download and trim YouTube videos to MP3 using Pytube and Pydub.
 ```bash
 pip install -r requirements.txt
 ```
+
+## Usage
+
+Run the script:
+```bash
+python [main.py](http://_vscodecontentref_/5)
+```
