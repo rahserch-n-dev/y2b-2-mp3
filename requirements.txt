@@ -3,3 +3,4 @@ pydub
 mutagen
 yt-dlp
 ffmpeg-python
+youtube-transcript-api
