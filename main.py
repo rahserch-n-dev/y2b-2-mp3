@@ -1,286 +1,472 @@
-import os
-import subprocess
-import re
+import argparse
+import json
 import logging
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
-# --- Configuration ---
-DOWNLOAD_FOLDER = "mp3_downloads"  # Folder to save downloaded MP3s
-DEFAULT_CLIP_LENGTH_SECONDS = 60  # Default length for trimming
+import yt_dlp
+from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi
 
-# --- Setup Logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+DATA_ROOT = Path("data")
+DEFAULT_LANGUAGES = ["en", "en-US", "en-GB"]
+MANIFEST_NAME = "manifest.json"
 
-# --- Helper Functions ---
-def sanitize_filename(name):
-    """
-    Sanitizes a string to be a valid filename.
-    Removes illegal characters and replaces spaces.
-    """
-    if not name:
-        name = "untitled_audio"
-    # Remove most non-alphanumeric characters (except hyphens, underscores, periods)
-    name = re.sub(r'[^\w\-\.]', '_', name)
-    # Replace multiple underscores/hyphens with a single one
-    name = re.sub(r'__+', '_', name)
-    name = re.sub(r'--+', '-', name)
-    # Remove leading/trailing underscores/hyphens
-    name = name.strip('_-')
-    return name if name else "untitled_audio"
 
-def ensure_download_folder():
-    """Ensures the download folder exists."""
-    Path(DOWNLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
+class YDLLogger:
+    def debug(self, message: str) -> None:
+        logging.debug(message)
 
-def run_ytdlp_command(command):
-    """
-    Runs a yt-dlp command using subprocess and captures its output.
-    Returns the last line of stdout (expected to be the filepath) or None on error.
-    """
+    def warning(self, message: str) -> None:
+        logging.warning(message)
+
+    def error(self, message: str) -> None:
+        logging.error(message)
+
+
+def configure_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="YouTube ingestion utility for audio and transcript datasets."
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging output.",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    playlist_parser = subparsers.add_parser(
+        "ingest-playlist",
+        help="Download audio and transcripts for every video in a playlist.",
+    )
+    playlist_parser.add_argument(
+        "--playlist-url",
+        required=True,
+        help="YouTube playlist URL to ingest.",
+    )
+    playlist_parser.add_argument(
+        "--languages",
+        nargs="+",
+        default=DEFAULT_LANGUAGES,
+        help="Language codes to request for transcripts, ordered by priority.",
+    )
+    playlist_parser.add_argument(
+        "--max-videos",
+        type=int,
+        default=None,
+        help="Optional limit on the number of videos to process.",
+    )
+    playlist_parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Reuse existing audio files when present.",
+    )
+    playlist_parser.add_argument(
+        "--skip-audio",
+        action="store_true",
+        help="Do not download audio assets.",
+    )
+    playlist_parser.add_argument(
+        "--skip-transcripts",
+        action="store_true",
+        help="Do not fetch transcripts.",
+    )
+    playlist_parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=DATA_ROOT,
+        help="Directory where playlist assets and metadata will be stored.",
+    )
+
+    video_parser = subparsers.add_parser(
+        "download-video",
+        help="Download a single YouTube video as an MP3 file.",
+    )
+    video_parser.add_argument(
+        "--url",
+        required=True,
+        help="YouTube video URL to download.",
+    )
+    video_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("mp3_downloads"),
+        help="Directory for saved MP3 files.",
+    )
+    video_parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip download if the MP3 already exists.",
+    )
+
+    return parser
+
+
+def extract_playlist_id(playlist_url: str) -> Optional[str]:
+    parsed = urlparse(playlist_url)
+    query = parse_qs(parsed.query)
+    if "list" in query and query["list"]:
+        return query["list"][0]
+    if "list=" in playlist_url:
+        return playlist_url.split("list=")[-1].split("&")[0]
+    return None
+
+
+def ensure_directories(paths: List[Path]) -> None:
+    for path in paths:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def read_json(path: Path) -> Dict:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json(path: Path, payload: Dict) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=True, indent=2)
+        handle.write("\n")
+
+
+def relative_to_base(path: Optional[Path], base: Path) -> Optional[str]:
+    if path is None:
+        return None
     try:
-        logging.info(f"Executing yt-dlp command: {' '.join(command)}")
-        process = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,  # Don't raise an exception for non-zero exit codes immediately
-            encoding='utf-8'
-        )
-
-        if process.returncode != 0:
-            logging.error(f"yt-dlp error (code {process.returncode}):")
-            if process.stdout:
-                logging.error(f"yt-dlp stdout:\n{process.stdout.strip()}")
-            if process.stderr:
-                logging.error(f"yt-dlp stderr:\n{process.stderr.strip()}")
-            return None
-
-        # Assuming the last non-empty line of stdout is the filepath
-        output_lines = [line for line in process.stdout.strip().split('\n') if line.strip()]
-        if output_lines:
-            filepath = output_lines[-1].strip()
-            # Verify the path isn't pointing to the template itself due to an error
-            if "%(title)s" not in filepath and "%(ext)s" not in filepath:
-                 # Basic check that the file reported by yt-dlp actually exists
-                if Path(filepath).exists() and Path(filepath).is_file():
-                    logging.info(f"yt-dlp successfully processed: {filepath}")
-                    return filepath
-                else:
-                    logging.error(f"yt-dlp reported filepath '{filepath}' but it was not found or is not a file.")
-                    logging.error("This might happen if the video title leads to an invalid/empty filename "
-                                  "or if there were permission issues.")
-                    if process.stderr: # Log stderr again if file not found, it might contain clues
-                        logging.error(f"yt-dlp stderr (for missing file context):\n{process.stderr.strip()}")
-                    return None
-            else:
-                logging.error(f"yt-dlp output filepath seems to be an unresolved template: {filepath}")
-                return None
-        else:
-            logging.error("yt-dlp did not return a filepath in stdout.")
-            if process.stderr:
-                logging.error(f"yt-dlp stderr:\n{process.stderr.strip()}")
-            return None
-
-    except FileNotFoundError:
-        logging.error("yt-dlp command not found. Please ensure yt-dlp is installed and in your system's PATH.")
-        return None
-    except Exception as e:
-        logging.error(f"An unexpected error occurred while running yt-dlp: {e}")
-        return None
-
-# --- Core Functions ---
-def download_mp3_with_ytdlp(video_url):
-    """
-    Downloads audio from a video URL as MP3 using yt-dlp.
-    Saves to DOWNLOAD_FOLDER with a filename based on the video title.
-    Returns the full path to the downloaded MP3 file or None if an error occurs.
-    """
-    ensure_download_folder()
-
-    # Output template for yt-dlp. It will create the filename based on video metadata.
-    # Using a temporary placeholder for the title initially if needed, but yt-dlp's own templating is better.
-    # The --print option will give the *actual* final path.
-    # We use a generic output template that yt-dlp will fill.
-    # %(title)s will be sanitized by yt-dlp.
-    # --restrict-filenames can be added for stricter sanitization if needed.
-    output_template = os.path.join(DOWNLOAD_FOLDER, "%(title)s.%(ext)s")
-
-    # Consider adding --restrict-filenames if you encounter issues with special characters in titles
-    # For extremely problematic titles, yt-dlp might use the ID. The --print option handles this.
-    # Using 'bestaudio/best' and letting ffmpeg handle post-processing for format ensures better source quality.
-    cmd = [
-        "yt-dlp",
-        "-x",  # --extract-audio
-        "--audio-format", "mp3",
-        "--audio-quality", "0",  # 0 is best quality for variable bitrate (VBR)
-        #"--get-filename", # Alternative: get filename first, then download. But --print is good for post-dl confirm.
-        "--print", "filepath", # More direct way to get the final path
-        # Or for older yt-dlp that might not support just "filepath":
-        # "--print", "%(filepath)q", # q for quoted, safer for paths with spaces
-        "-o", output_template,
-        "--ffmpeg-location", "/path/to/your/ffmpeg", # Optional: Explicitly specify if not in PATH
-        # "--verbose", # Uncomment for more detailed yt-dlp output during debugging
-        video_url
-    ]
-    # Remove --ffmpeg-location if FFmpeg is reliably in your PATH
-    # For example, if FFmpeg is in PATH, remove the line:
-    # cmd.pop(cmd.index("--ffmpeg-location") + 1)
-    # cmd.pop(cmd.index("--ffmpeg-location"))
-    # For now, assuming it might be needed by some users. If FFmpeg is in PATH, yt-dlp usually finds it.
-    # A common setup is to have ffmpeg in PATH, so let's remove the explicit path for now.
-    # If issues, user can add it back or ensure ffmpeg is in PATH.
-    cmd = [item for item in cmd if not item.startswith("--ffmpeg-location")]
+        return str(path.relative_to(base))
+    except ValueError:
+        return str(path.resolve())
 
 
-    downloaded_path = run_ytdlp_command(cmd)
+def get_playlist_entries(playlist_url: str) -> Tuple[Dict, List[Dict]]:
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+        "logger": YDLLogger(),
+    }
+    with yt_dlp.YoutubeDL(options) as downloader:
+        info = downloader.extract_info(playlist_url, download=False)
+    entries = info.get("entries") or []
+    for index, entry in enumerate(entries, start=1):
+        entry.setdefault("playlist_index", index)
+    return info, entries
 
-    if downloaded_path and Path(downloaded_path).exists():
-        return downloaded_path
-    else:
-        logging.error(f"Failed to download or locate MP3 for URL: {video_url}")
-        return None
 
-def trim_and_tag_audio(mp3_path, new_title=None, new_artist=None, clip_length_seconds=None):
-    """
-    Loads an MP3, optionally trims it, and optionally re-tags it.
-    (This is a placeholder for your pydub logic)
-    """
-    if not mp3_path or not Path(mp3_path).exists():
-        logging.error(f"trim_and_tag: Invalid or non-existent MP3 path: {mp3_path}")
-        return None
+def get_video_info(video_url: str) -> Dict:
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "logger": YDLLogger(),
+    }
+    with yt_dlp.YoutubeDL(options) as downloader:
+        return downloader.extract_info(video_url, download=False)
+
+
+def download_audio(video_url: str, output_dir: Path) -> Dict:
+    options = {
+        "format": "bestaudio/best",
+        "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "logger": YDLLogger(),
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ],
+    }
+    with yt_dlp.YoutubeDL(options) as downloader:
+        return downloader.extract_info(video_url, download=True)
+
+
+def fetch_transcript(video_id: str, languages: List[str]) -> Tuple[Optional[List[Dict]], Optional[str]]:
+    try:
+        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+    except (TranscriptsDisabled, NoTranscriptFound) as error:
+        logging.warning("Transcript listing not available for %s: %s", video_id, error)
+        return None, None
+    except Exception as error:
+        logging.warning("Unexpected transcript listing error for %s: %s", video_id, error)
+        return None, None
+
+    ordered_languages: List[str] = []
+    for code in languages:
+        if code not in ordered_languages:
+            ordered_languages.append(code)
+    for fallback in ["en", "en-US", "en-GB"]:
+        if fallback not in ordered_languages:
+            ordered_languages.append(fallback)
 
     try:
-        from pydub import AudioSegment
-        from pydub.utils import mediainfo
-    except ImportError:
-        logging.error("pydub library is not installed. Please install it with 'pip install pydub'.")
-        return None
-
-    logging.info(f"Attempting to process audio file: {mp3_path}")
+        transcript_obj = transcripts.find_transcript(ordered_languages)
+        transcript_data = transcript_obj.fetch()
+        return transcript_data, transcript_obj.language_code
+    except NoTranscriptFound:
+        logging.debug("Manual transcript not found for %s.", video_id)
 
     try:
-        audio = AudioSegment.from_file(mp3_path, format="mp3")
-        logging.info(f"Successfully loaded '{mp3_path}' with pydub.")
+        generated_obj = transcripts.find_generated_transcript(ordered_languages)
+        transcript_data = generated_obj.fetch()
+        return transcript_data, generated_obj.language_code
+    except NoTranscriptFound:
+        logging.debug("Auto transcript not found for %s.", video_id)
 
-        # --- 1. Trimming (Example) ---
-        if clip_length_seconds is not None and clip_length_seconds > 0:
-            duration_ms = len(audio)
-            clip_length_ms = clip_length_seconds * 1000
-            if clip_length_ms < duration_ms:
-                audio = audio[:clip_length_ms]
-                logging.info(f"Trimmed audio to {clip_length_seconds} seconds.")
-            else:
-                logging.info(f"Clip length ({clip_length_seconds}s) is longer than or equal to audio duration. No trimming performed.")
-
-        # --- 2. Tagging (Example) ---
-        # pydub uses ffmpeg for exporting with tags.
-        # The 'tags' parameter in export is a dictionary.
-        tags_to_apply = {}
-        current_tags = mediainfo(mp3_path).get('TAG', {})
-
-        if new_title:
-            tags_to_apply['title'] = new_title
-        elif 'title' in current_tags: # Keep original if not overwriting
-            tags_to_apply['title'] = current_tags['title']
-
-        if new_artist:
-            tags_to_apply['artist'] = new_artist
-        elif 'artist' in current_tags: # Keep original if not overwriting
-            tags_to_apply['artist'] = current_tags['artist']
-        
-        # Add other tags as needed, e.g., album
-        # tags_to_apply['album'] = "My Album"
-
-
-        # --- 3. Exporting (Overwriting original in this example) ---
-        # You might want to save to a new file instead of overwriting.
-        # For example: processed_filename = Path(mp3_path).stem + "_processed.mp3"
-        # processed_path = Path(DOWNLOAD_FOLDER) / processed_filename
-        
-        export_path = mp3_path # Overwriting
-        
-        logging.info(f"Exporting processed audio to: {export_path} with tags: {tags_to_apply}")
-        audio.export(export_path, format="mp3", tags=tags_to_apply)
-        logging.info("Successfully trimmed and/or tagged audio.")
-        return export_path
-
-    except FileNotFoundError:
-        logging.error(f"pydub: File not found at {mp3_path}. This should not happen if path was pre-validated.")
-        return None
-    except Exception as e: # Catch pydub specific errors like CouldntDecodeError or generic ones
-        logging.error(f"pydub: Error processing audio file '{mp3_path}': {e}")
-        logging.error("Ensure FFmpeg is installed and in your PATH, and the file is a valid MP3.")
-        return None
-
-# --- Main Execution ---
-if __name__ == "__main__":
-    print("🎵 YouTube to MP3 Downloader & Processor 🎵")
-    print("--------------------------------------------")
-
-    video_url = input("Enter YouTube video URL: ").strip()
-
-    if not video_url:
-        logging.error("No URL provided. Exiting.")
-        exit()
-
-    logging.info(f"Attempting to download audio from: {video_url}")
-    downloaded_mp3_file = download_mp3_with_ytdlp(video_url)
-
-    if downloaded_mp3_file:
-        logging.info(f"Successfully downloaded MP3 to: {downloaded_mp3_file}")
-
-        # Example: Ask if user wants to trim and tag
-        choice = input("Do you want to trim and/or re-tag the MP3? (yes/no): ").strip().lower()
-        if choice == 'yes':
+    for transcript_obj in transcripts:
+        if not transcript_obj.is_translatable:
+            continue
+        for target_language in ordered_languages:
             try:
-                original_filename = Path(downloaded_mp3_file).stem
-                default_title = original_filename.replace('_', ' ') # Basic title from filename
-
-                custom_title = input(f"Enter new title (or press Enter to keep/use '{default_title}'): ").strip()
-                if not custom_title:
-                    custom_title = default_title # Use a sensible default if empty
-
-                custom_artist = input("Enter new artist (or press Enter to keep original/leave blank): ").strip()
-                
-                clip_len_str = input(f"Enter clip length in seconds (e.g., {DEFAULT_CLIP_LENGTH_SECONDS}, or 0 for no trim): ").strip()
-                clip_len = DEFAULT_CLIP_LENGTH_SECONDS
-                if clip_len_str:
-                    try:
-                        clip_len_val = int(clip_len_str)
-                        if clip_len_val == 0:
-                            clip_len = None # No trimming
-                            logging.info("No trimming will be performed.")
-                        elif clip_len_val < 0:
-                            logging.warning("Clip length cannot be negative. Using default/no trim.")
-                            clip_len = None if DEFAULT_CLIP_LENGTH_SECONDS == 0 else DEFAULT_CLIP_LENGTH_SECONDS
-                        else:
-                            clip_len = clip_len_val
-                    except ValueError:
-                        logging.warning(f"Invalid clip length. Using default {DEFAULT_CLIP_LENGTH_SECONDS}s or no trim.")
-                        clip_len = None if DEFAULT_CLIP_LENGTH_SECONDS == 0 else DEFAULT_CLIP_LENGTH_SECONDS
-                else: # User pressed enter
-                    clip_len = None if DEFAULT_CLIP_LENGTH_SECONDS == 0 else DEFAULT_CLIP_LENGTH_SECONDS
-
-
-                processed_file = trim_and_tag_audio(
-                    downloaded_mp3_file,
-                    new_title=custom_title if custom_title else None,
-                    new_artist=custom_artist if custom_artist else None,
-                    clip_length_seconds=clip_len
+                translated = transcript_obj.translate(target_language)
+                transcript_data = translated.fetch()
+                return transcript_data, target_language
+            except (NoTranscriptFound, ValueError):
+                continue
+            except Exception as error:
+                logging.debug(
+                    "Transcript translation failed for %s to %s: %s",
+                    video_id,
+                    target_language,
+                    error,
                 )
-                if processed_file:
-                    logging.info(f"Processed file saved at: {processed_file}")
-                else:
-                    logging.error("Failed to process the MP3 file.")
-            except Exception as e:
-                logging.error(f"Error during trim/tag input or call: {e}")
-        else:
-            logging.info("Skipping trim and tag.")
-    else:
-        logging.error(f"Could not download MP3 from {video_url}.")
+    logging.warning("No transcript could be retrieved for %s.", video_id)
+    return None, None
 
-    logging.info("Script finished.")
+
+def save_transcript(transcript_dir: Path, video_id: str, language: Optional[str], segments: List[Dict]) -> Path:
+    transcript_path = transcript_dir / f"{video_id}.json"
+    payload = {
+        "video_id": video_id,
+        "language": language,
+        "segments": segments,
+    }
+    write_json(transcript_path, payload)
+    return transcript_path
+
+
+def ingest_playlist_command(args: argparse.Namespace) -> int:
+    playlist_id = extract_playlist_id(args.playlist_url)
+    if not playlist_id:
+        logging.error("Unable to determine playlist id from %s.", args.playlist_url)
+        return 1
+
+    playlist_root = args.output_root.resolve() / playlist_id
+    audio_dir = playlist_root / "audio"
+    transcripts_dir = playlist_root / "transcripts"
+    metadata_dir = playlist_root / "metadata"
+    ensure_directories([playlist_root, audio_dir, transcripts_dir, metadata_dir])
+
+    manifest_path = playlist_root / MANIFEST_NAME
+    if manifest_path.exists():
+        manifest = read_json(manifest_path)
+    else:
+        manifest = {"videos": {}}
+
+    manifest["playlist_url"] = args.playlist_url
+    manifest["playlist_id"] = playlist_id
+    manifest["language_preferences"] = args.languages
+
+    playlist_info, entries = get_playlist_entries(args.playlist_url)
+    if not entries:
+        logging.error("No videos were found in the playlist.")
+        return 1
+
+    if args.max_videos is not None and args.max_videos > 0:
+        entries = entries[: args.max_videos]
+
+    summary = {
+        "processed": 0,
+        "audio_downloaded": 0,
+        "audio_skipped": 0,
+        "transcripts_saved": 0,
+        "errors": 0,
+    }
+
+    total_videos = len(entries)
+    logging.info(
+        "Starting ingestion for playlist '%s' with %d videos.",
+        playlist_info.get("title", playlist_id),
+        total_videos,
+    )
+
+    for index, entry in enumerate(entries, start=1):
+        summary["processed"] += 1
+        entry_id = entry.get("id")
+        entry_url = entry.get("url")
+        if entry_url and entry_url.startswith("http"):
+            video_url = entry_url
+        else:
+            if not entry_id:
+                logging.error("Skipping entry %d: missing video id.", index)
+                summary["errors"] += 1
+                continue
+            video_url = f"https://www.youtube.com/watch?v={entry_id}"
+
+        logging.info("Processing video %d of %d: %s", index, total_videos, video_url)
+
+        try:
+            video_info = get_video_info(video_url)
+        except Exception as error:
+            logging.error("Metadata retrieval failed for %s: %s", video_url, error)
+            summary["errors"] += 1
+            continue
+
+        video_id = video_info.get("id")
+        if not video_id:
+            logging.error("Video metadata missing id for %s.", video_url)
+            summary["errors"] += 1
+            continue
+
+        audio_path = audio_dir / f"{video_id}.mp3"
+        download_audio_now = not args.skip_audio
+        if args.skip_existing and audio_path.exists():
+            download_audio_now = False
+            logging.info("Audio already exists for %s; skipping download.", video_id)
+
+        if download_audio_now:
+            try:
+                download_audio(video_url, audio_dir)
+                if audio_path.exists():
+                    logging.info("Audio saved to %s.", audio_path)
+                    summary["audio_downloaded"] += 1
+                else:
+                    logging.error("Audio file missing after download for %s.", video_id)
+                    summary["errors"] += 1
+                    continue
+            except Exception as error:
+                logging.error("Audio download failed for %s: %s", video_id, error)
+                summary["errors"] += 1
+                continue
+        else:
+            summary["audio_skipped"] += 1
+
+        transcript_path: Optional[Path] = None
+        transcript_language: Optional[str] = None
+        if not args.skip_transcripts:
+            segments, transcript_language = fetch_transcript(video_id, args.languages)
+            if segments:
+                transcript_path = save_transcript(transcripts_dir, video_id, transcript_language, segments)
+                summary["transcripts_saved"] += 1
+                logging.info("Transcript saved to %s.", transcript_path)
+            else:
+                logging.warning("Transcript unavailable for %s.", video_id)
+
+        metadata_path = metadata_dir / f"{video_id}.json"
+        metadata_payload = {
+            "video_id": video_id,
+            "title": video_info.get("title"),
+            "description": video_info.get("description"),
+            "channel": video_info.get("uploader"),
+            "uploader_id": video_info.get("uploader_id"),
+            "channel_id": video_info.get("channel_id"),
+            "duration": video_info.get("duration"),
+            "view_count": video_info.get("view_count"),
+            "like_count": video_info.get("like_count"),
+            "webpage_url": video_info.get("webpage_url") or video_url,
+            "thumbnail": video_info.get("thumbnail"),
+            "playlist_index": entry.get("playlist_index"),
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "audio_path": relative_to_base(audio_path if audio_path.exists() else None, playlist_root),
+            "transcript_path": relative_to_base(transcript_path, playlist_root),
+            "transcript_language": transcript_language,
+        }
+        write_json(metadata_path, metadata_payload)
+
+        manifest["videos"][video_id] = {
+            "title": video_info.get("title"),
+            "webpage_url": video_info.get("webpage_url") or video_url,
+            "audio_path": relative_to_base(audio_path if audio_path.exists() else None, playlist_root),
+            "transcript_path": relative_to_base(transcript_path, playlist_root),
+            "transcript_language": transcript_language,
+            "metadata_path": relative_to_base(metadata_path, playlist_root),
+            "duration": video_info.get("duration"),
+            "channel": video_info.get("uploader"),
+            "playlist_index": entry.get("playlist_index"),
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+        }
+
+    manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+    write_json(manifest_path, manifest)
+
+    logging.info(
+        "Ingestion complete. Processed=%d downloaded=%d transcripts=%d skipped_audio=%d errors=%d",
+        summary["processed"],
+        summary["audio_downloaded"],
+        summary["transcripts_saved"],
+        summary["audio_skipped"],
+        summary["errors"],
+    )
+    return 0 if summary["errors"] == 0 else 1
+
+
+def download_video_command(args: argparse.Namespace) -> int:
+    output_dir = args.output_dir.resolve()
+    ensure_directories([output_dir])
+
+    try:
+        video_info = get_video_info(args.url)
+    except Exception as error:
+        logging.error("Failed to retrieve metadata: %s", error)
+        return 1
+
+    video_id = video_info.get("id")
+    if not video_id:
+        logging.error("Video metadata missing id.")
+        return 1
+
+    audio_path = output_dir / f"{video_id}.mp3"
+    if args.skip_existing and audio_path.exists():
+        logging.info("Audio already exists at %s; skipping download.", audio_path)
+        return 0
+
+    try:
+        download_audio(args.url, output_dir)
+    except Exception as error:
+        logging.error("Download failed: %s", error)
+        return 1
+
+    if audio_path.exists():
+        logging.info("Audio saved to %s.", audio_path)
+        return 0
+
+    logging.error("Download reported success but audio file is missing.")
+    return 1
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    configure_logging(verbose=getattr(args, "verbose", False))
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    if args.command == "ingest-playlist":
+        return ingest_playlist_command(args)
+    if args.command == "download-video":
+        return download_video_command(args)
+
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
